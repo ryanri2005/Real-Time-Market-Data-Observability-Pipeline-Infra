@@ -3,8 +3,8 @@ import json
 import logging
 from datetime import datetime, timezone
 
-import websockets
 from prometheus_client import Counter, Gauge, start_http_server
+from websockets.asyncio.client import connect
 
 
 # ---------------------------------------------------------
@@ -15,24 +15,27 @@ WS_URL = "wss://advanced-trade-ws.coinbase.com"
 PRODUCT_ID = "BTC-USD"
 METRICS_PORT = 8000
 
+INITIAL_RECONNECT_DELAY = 1
+MAX_RECONNECT_DELAY = 60
+
 
 # ---------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------
 
 MESSAGES_RECEIVED = Counter(
-    "coinbase_messages_received",
-    "Total number of ticker messages received from Coinbase",
+    "coinbase_messages_received_total",
+    "Total number of Coinbase ticker messages received.",
 )
 
 MESSAGE_LATENCY = Gauge(
     "coinbase_message_latency_seconds",
-    "Estimated exchange-to-client message latency in seconds",
+    "Seconds between the Coinbase ticker timestamp and local UTC time.",
 )
 
 WEBSOCKET_RECONNECTS = Counter(
-    "coinbase_websocket_reconnects",
-    "Total number of WebSocket reconnection attempts",
+    "coinbase_websocket_reconnects_total",
+    "Total number of WebSocket reconnection attempts.",
 )
 
 
@@ -49,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------
-# Coinbase WebSocket subscription
+# Coinbase subscription
 # ---------------------------------------------------------
 
 SUBSCRIBE_MESSAGE = {
@@ -60,15 +63,17 @@ SUBSCRIBE_MESSAGE = {
 
 
 # ---------------------------------------------------------
-# Message processing
+# Timestamp handling
 # ---------------------------------------------------------
 
 def calculate_latency(exchange_timestamp: str) -> float | None:
     """
-    Calculate the difference between the local UTC time and the
-    timestamp supplied by Coinbase.
+    Calculate the elapsed time between Coinbase's timestamp and
+    the local UTC clock.
 
-    Returns latency in seconds.
+    Returns:
+        Latency in seconds, or None when the timestamp is invalid
+        or appears to be ahead of the local clock.
     """
 
     try:
@@ -83,8 +88,6 @@ def calculate_latency(exchange_timestamp: str) -> float | None:
 
         latency = (local_time - exchange_time).total_seconds()
 
-        # A clock difference or malformed timestamp can produce
-        # a negative value. Do not publish negative latency.
         if latency < 0:
             return None
 
@@ -94,28 +97,41 @@ def calculate_latency(exchange_timestamp: str) -> float | None:
         return None
 
 
+# ---------------------------------------------------------
+# Message processing
+# ---------------------------------------------------------
+
 def process_message(raw_message: str) -> None:
     """
-    Parse one Coinbase WebSocket message and update Prometheus metrics.
+    Parse a Coinbase WebSocket message and update Prometheus
+    metrics for ticker events.
     """
 
     try:
         message = json.loads(raw_message)
     except json.JSONDecodeError:
-        logger.warning("Received invalid JSON message")
+        logger.warning("Received invalid JSON from Coinbase.")
+        return
+
+    if message.get("channel") != "ticker":
         return
 
     MESSAGES_RECEIVED.inc()
 
-    exchange_timestamp = message.get("timestamp")
+    for event in message.get("events", []):
+        for ticker in event.get("tickers", []):
+            if ticker.get("product_id") != PRODUCT_ID:
+                continue
 
-    if exchange_timestamp is None:
-        return
+            exchange_timestamp = ticker.get("time")
 
-    latency = calculate_latency(exchange_timestamp)
+            if exchange_timestamp is None:
+                continue
 
-    if latency is not None:
-        MESSAGE_LATENCY.set(latency)
+            latency = calculate_latency(exchange_timestamp)
+
+            if latency is not None:
+                MESSAGE_LATENCY.set(latency)
 
 
 # ---------------------------------------------------------
@@ -124,33 +140,36 @@ def process_message(raw_message: str) -> None:
 
 async def consume_market_data() -> None:
     """
-    Maintain a persistent connection to Coinbase.
+    Maintain a persistent Coinbase WebSocket connection.
 
-    Connection failures trigger an automatic reconnect with
-    exponential backoff.
+    If the connection fails, the service waits using exponential
+    backoff before attempting to reconnect.
     """
 
-    reconnect_delay = 1
+    reconnect_delay = INITIAL_RECONNECT_DELAY
 
     while True:
         try:
             logger.info("Connecting to Coinbase WebSocket...")
 
-            async with websockets.connect(
+            async with connect(
                 WS_URL,
                 ping_interval=20,
                 ping_timeout=20,
+                max_size=1_048_576,
             ) as websocket:
 
-                await websocket.send(json.dumps(SUBSCRIBE_MESSAGE))
+                await websocket.send(
+                    json.dumps(SUBSCRIBE_MESSAGE)
+                )
 
                 logger.info(
-                    "Connected. Subscribed to %s ticker channel.",
+                    "Connected and subscribed to %s ticker channel.",
                     PRODUCT_ID,
                 )
 
-                # Reset the backoff after a successful connection.
-                reconnect_delay = 1
+                # A successful connection resets the backoff.
+                reconnect_delay = INITIAL_RECONNECT_DELAY
 
                 async for raw_message in websocket:
                     process_message(raw_message)
@@ -168,7 +187,7 @@ async def consume_market_data() -> None:
             WEBSOCKET_RECONNECTS.inc()
 
             logger.info(
-                "Reconnecting in %d seconds...",
+                "Reconnecting in %d seconds.",
                 reconnect_delay,
             )
 
@@ -176,7 +195,7 @@ async def consume_market_data() -> None:
 
             reconnect_delay = min(
                 reconnect_delay * 2,
-                60,
+                MAX_RECONNECT_DELAY,
             )
 
 
@@ -186,14 +205,14 @@ async def consume_market_data() -> None:
 
 def main() -> None:
     """
-    Start the Prometheus metrics server and market-data consumer.
+    Start Prometheus metrics and the asynchronous market-data
+    consumer.
     """
 
     start_http_server(METRICS_PORT)
 
     logger.info(
-        "Prometheus metrics available at "
-        "http://localhost:%d/metrics",
+        "Prometheus metrics available on port %d.",
         METRICS_PORT,
     )
 
