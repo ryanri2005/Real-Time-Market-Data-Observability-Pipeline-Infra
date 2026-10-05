@@ -1,2 +1,2 @@
-websockets==15.0.1
-prometheus-client==0.23.1
+websockets==17.1
+prometheus-client==0.26.0
