@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: market-data-metrics
+  labels:
+    app: market-data-ingestion
+
+spec:
+  type: ClusterIP
+
+  selector:
+    app: market-data-ingestion
+
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 8000
+      targetPort: metrics
