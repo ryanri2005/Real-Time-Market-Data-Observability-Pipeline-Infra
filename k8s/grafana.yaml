@@ -54,7 +54,7 @@ spec:
       terminationGracePeriodSeconds: 15
       containers:
         - name: grafana
-          image: grafana/grafana:13.2.4
+          image: grafana/grafana:13.0.9
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
